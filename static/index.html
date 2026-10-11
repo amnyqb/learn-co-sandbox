@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f5f4f0">
+  <title>vid_down — Local video workspace</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <div class="workspace">
+    <header class="header">
+      <a class="brand" href="/" aria-label="vid_down home">
+        <span class="brand-mark"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v15m-6-6 6 6 6-6"/></svg></span>
+        <span>vid_down</span>
+      </a>
+      <span class="workspace-label">Local video workspace</span>
+    </header>
+    <main>
+      <section class="intro">
+        <h1>Your stream. Your file.</h1>
+        <p>Download M3U8 video and make it a little lighter.</p>
+      </section>
+      <form id="download-form" class="download-form">
+        <h2 class="form-heading"><span class="section-number" aria-hidden="true">01</span>New download</h2>
+        <div class="field">
+          <label for="stream-url">Stream URL</label>
+          <input id="stream-url" name="url" type="url" placeholder="https://example.com/video/playlist.m3u8" required autocomplete="off" spellcheck="false" maxlength="8192">
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label for="file-name">File name</label>
+            <input id="file-name" name="name" placeholder="my-video" maxlength="120" autocomplete="off">
+          </div>
+          <div class="field">
+            <label for="format">Format</label>
+            <div class="select-wrap">
+              <select id="format" name="format">
+                <option value="mp4">MP4 · H.264</option>
+                <option value="hevc">MP4 · HEVC (smaller, slower)</option>
+                <option value="webm">WebM · VP9</option>
+              </select>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+            </div>
+          </div>
+        </div>
+        <fieldset class="presets">
+          <legend>Optimize for</legend>
+          <div class="preset-row">
+            <label class="preset"><input type="radio" name="preset" value="small"><span class="preset-text"><strong>Smaller file</strong><span>720p · efficient compression</span></span></label>
+            <label class="preset"><input type="radio" name="preset" value="balanced" checked><span class="preset-text"><strong>Balanced</strong><span>1080p · everyday quality</span></span></label>
+            <label class="preset"><input type="radio" name="preset" value="original"><span class="preset-text"><strong>Keep original</strong><span>No re-encoding · fastest</span></span></label>
+          </div>
+        </fieldset>
+        <details class="advanced" id="advanced">
+          <summary><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m6 3 5 5-5 5"/></svg>More control</summary>
+          <div class="advanced-fields">
+            <div class="field"><label for="target-size">Target file size <span class="optional">optional</span></label><div class="unit-input"><input id="target-size" type="number" min="0.1" max="100000" step="0.1" placeholder="e.g. 100"><span>MB</span></div><p class="field-help" id="size-help">Two-pass encoding aims for this size. Smaller targets reduce quality.</p></div>
+            <div class="field"><label for="referer">Referer URL <span class="optional">optional</span></label><input id="referer" type="url" placeholder="https://example.com/watch" spellcheck="false" maxlength="2048"><p class="field-help">The page URL, if the stream requires it.</p></div>
+          </div>
+          <div class="advanced-fields">
+            <div class="field"><label for="connections">Parallel connections</label><input id="connections" type="number" min="1" max="128" step="1" value="128" required><p class="field-help">Up to 128 segment requests. Automatically reduces on rate limits.</p></div>
+            <div class="field"><label for="download-engine">Download method</label><div class="select-wrap"><select id="download-engine"><option value="auto">Automatic · parallel with FFmpeg fallback</option><option value="parallel">Parallel segments only</option><option value="ffmpeg">FFmpeg compatibility · sequential</option></select><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></div><p class="field-help">Automatic handles compatible VOD streams locally before encoding.</p></div>
+          </div>
+          <details class="access-options" id="access-options">
+            <summary>Access &amp; alternatives</summary>
+            <div class="advanced-fields">
+              <div class="field"><label for="user-agent">User-Agent</label><input id="user-agent" value="vid_down/1.1" maxlength="1024" spellcheck="false"><button class="text-button" id="browser-agent" type="button">Use this browser's User-Agent</button></div>
+              <div class="field"><label for="cookies">Cookie header <span class="optional">optional</span></label><input id="cookies" type="password" autocomplete="off" placeholder="session=…" maxlength="8192"><p class="field-help">Your existing session, if needed. Sent only to the primary URL's origin.</p></div>
+            </div>
+            <div class="field access-field"><label for="request-headers">Request headers <span class="optional">JSON object</span></label><textarea id="request-headers" rows="3" placeholder='{"Origin": "https://example.com"}' spellcheck="false" autocomplete="off"></textarea><p class="field-help">For example Origin or Authorization. Custom headers and cookies work with all download methods and stay out of saved history.</p></div>
+            <div class="field access-field"><label for="alternative-urls">Alternative stream URLs <span class="optional">up to 5</span></label><textarea id="alternative-urls" rows="3" placeholder="One alternative M3U8 URL per line" spellcheck="false" autocomplete="off"></textarea><p class="field-help">Try these in order if a stream fails. Credentials remain scoped to the primary URL's origin.</p></div>
+            <p class="field-help">An expired link or HTTP 401/403 needs current access credentials. For a cloud network block, allow the stream domains in environment settings or run the app on your own computer. Existing HTTP_PROXY / HTTPS_PROXY settings are supported.</p>
+          </details>
+        </details>
+        <p id="form-error" class="error-message" role="alert" hidden></p>
+        <div class="form-bottom">
+          <p>Processed here. Files stay on this machine.</p>
+          <button type="submit" class="primary-button" id="submit-button"><span>Download &amp; convert</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h15m-6-6 6 6-6 6"/></svg></button>
+        </div>
+      </form>
+      <section class="downloads" aria-labelledby="downloads-heading">
+        <div class="downloads-heading"><h2 id="downloads-heading">Your downloads</h2><span id="file-count">0 files</span></div>
+        <p id="connection-message" class="error-message" role="status" hidden></p>
+        <div id="empty-state" class="empty-state"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M16 3v18m-7-7 7 7 7-7M4 22v6h24v-6"/></svg><p>Nothing here yet</p><span>Add a stream above to get your first file.</span></div>
+        <div id="job-list" aria-live="polite" aria-relevant="additions"></div>
+      </section>
+    </main>
+    <footer><span>Powered by FFmpeg</span><span>MP4 / HEVC / WebM</span></footer>
+  </div>
+  <dialog id="preview-dialog"><div class="preview-heading"><h2 id="preview-title">Video preview</h2><button type="button" id="close-preview" class="icon-button" aria-label="Close preview"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div><video id="preview-video" controls preload="metadata"></video><p class="field-help">If your browser cannot play this codec, download the file to play it locally.</p></dialog>
+</body>
+</html>
