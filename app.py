@@ -21,7 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from downloader import AccessError, CompatibilityError, HLSDownloader, MAX_CONNECTIONS
+from downloader import AccessError, CompatibilityError, HLSDownloader, MAX_CONNECTIONS, configure_file_limit, storage_error
 from relay import FFmpegRelay
 
 ROOT = Path(__file__).resolve().parent
@@ -413,7 +413,9 @@ class JobManager:
         except asyncio.CancelledError:
             self.update(job, status="cancelled", stage="Cancelled", error=None)
         except (ValueError, KeyError, OSError, httpx.HTTPError, asyncio.TimeoutError) as error:
-            if isinstance(error, httpx.HTTPStatusError):
+            if isinstance(error, OSError):
+                message = storage_error(error)
+            elif isinstance(error, httpx.HTTPStatusError):
                 message = f"The playlist returned HTTP {error.response.status_code}. Check its URL, expiry, and access requirements."
             elif isinstance(error, httpx.HTTPError):
                 message = "Could not reach the playlist. Check the URL and this machine's network access."
@@ -529,6 +531,7 @@ async def index():
 
 if __name__ == "__main__":
     import uvicorn
+    configure_file_limit()
     if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
         sys.exit("FFmpeg is required. Install it with your system package manager before starting vid_down.")
     uvicorn.run(app, host="127.0.0.1", port=int(os.environ.get("VID_DOWN_PORT", "8000")))

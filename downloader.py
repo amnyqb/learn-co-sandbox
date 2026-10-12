@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+import errno
 import math
 from pathlib import Path
 import re
@@ -13,6 +14,11 @@ import time
 from urllib.parse import urljoin, urlsplit
 
 import httpx
+
+try:
+    import resource
+except ImportError:  # Windows has no POSIX file-descriptor limit API.
+    resource = None
 
 MAX_CONNECTIONS = 128
 RETRY_CODES = {408, 425, 429, 500, 502, 503, 504}
@@ -24,6 +30,62 @@ class AccessError(ValueError):
 
 class CompatibilityError(ValueError):
     """An HLS feature for which native FFmpeg transport is appropriate."""
+
+
+def configure_file_limit():
+    """Best-effort capacity for two jobs; never lower an existing limit."""
+    if resource is None:
+        return
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft == resource.RLIM_INFINITY or soft >= 2048:
+            return
+        target = 2048 if hard == resource.RLIM_INFINITY else min(2048, hard)
+        if target > soft:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    except (OSError, ValueError):
+        pass  # Concurrency budgeting below still respects the existing limit.
+
+
+def safe_connection_limit(requested):
+    if resource is None:
+        return requested
+    try:
+        soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft != resource.RLIM_INFINITY:
+            # Each request uses a socket and a segment file; reserve space for
+            # two concurrent jobs plus the UI, FFmpeg, logs, and job persistence.
+            return min(requested, max(1, (soft - 128) // 4))
+    except (OSError, ValueError):
+        pass
+    return requested
+
+
+def storage_error(error):
+    """Explain OS failures without exposing paths or upstream credentials."""
+    if error.errno in {errno.EMFILE, errno.ENFILE}:
+        return "The open-file limit was reached. Reduce connections to 16, stop other downloads, or restart the updated app."
+    if error.errno in {errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)}:
+        return "The download disk is full or its storage quota was reached. Free space or set VID_DOWN_DATA to another disk."
+    if error.errno in {errno.EACCES, errno.EPERM}:
+        return "The download folder is not writable. Check folder permissions or set VID_DOWN_DATA to a writable folder."
+    if error.errno == errno.EROFS:
+        return "The download folder is on a read-only disk. Set VID_DOWN_DATA to a writable disk."
+    if error.errno == errno.ENOENT:
+        return "The temporary download folder is missing. Restart the app and add the stream again."
+    code = f" (OS error {error.errno})" if error.errno is not None else ""
+    return f"A download storage operation failed{code}. Check the disk and download folder."
+
+
+def file_limit_error(error):
+    # HTTPX wraps socket failures. Preserve the OS diagnosis through its causes.
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, OSError) and error.errno in {errno.EMFILE, errno.ENFILE}:
+            return error
+        error = error.__cause__ or error.__context__
+    return None
 
 
 def origin(url):
@@ -125,7 +187,8 @@ class HLSDownloader:
         self.completed = 0
         self.started = time.monotonic()
         self.last_report = 0
-        self.window = AdaptiveWindow(options.connections)
+        self.connection_limit = safe_connection_limit(options.connections)
+        self.window = AdaptiveWindow(self.connection_limit)
         self.client = None
 
     def headers(self, url):
@@ -257,7 +320,10 @@ class HLSDownloader:
                         return bytes(body).decode("utf-8-sig"), str(response.url)
             except (httpx.HTTPError, OSError) as error:
                 if isinstance(error, OSError):
-                    raise AccessError("Could not write video segments. Check free disk space and directory permissions.") from None
+                    raise AccessError(storage_error(error)) from None
+                limit_error = file_limit_error(error)
+                if limit_error:
+                    raise AccessError(storage_error(limit_error)) from None
                 if "CERTIFICATE_VERIFY_FAILED" in str(error) or "certificate verify failed" in str(error).lower():
                     raise AccessError(f"TLS certificate verification failed for {urlsplit(url).hostname}. Fix the server certificate or trusted CA configuration; verification stays enabled.") from None
                 if isinstance(error, httpx.ProxyError) and re.search(r"\b(403|407)\b", str(error)):
@@ -266,9 +332,13 @@ class HLSDownloader:
                     raise AccessError(f"Could not reach {urlsplit(url).hostname} after retries. Check network/domain access, your configured proxy, and the URL. Try an alternative URL or run on your own computer if cloud access is restricted.") from None
                 delay = retry_delay(None, attempt)
             finally:
-                if part:
-                    part.unlink(missing_ok=True)
-                await self.window.release()
+                try:
+                    if part:
+                        part.unlink(missing_ok=True)
+                except OSError as error:
+                    raise AccessError(storage_error(error)) from None
+                finally:
+                    await self.window.release()
             if delay is not None:
                 await asyncio.sleep(delay)
 
@@ -382,14 +452,14 @@ class HLSDownloader:
 
     async def download(self, url):
         self.directory.mkdir(parents=True, exist_ok=True)
-        limits = httpx.Limits(max_connections=self.options.connections, max_keepalive_connections=self.options.connections)
+        limits = httpx.Limits(max_connections=self.connection_limit, max_keepalive_connections=self.connection_limit)
         timeout = httpx.Timeout(30, connect=15, pool=30)
         async with httpx.AsyncClient(limits=limits, timeout=timeout, follow_redirects=True) as client:
             self.client = client
             local_playlist = await self.playlist(url)
             if not self.assets:
                 raise AccessError("The playlist has no complete video segments.")
-            self.window.maximum = min(self.options.connections, len(self.assets))
+            self.window.maximum = min(self.connection_limit, len(self.assets))
             self.window.limit = min(self.window.limit, self.window.maximum)
             self.started = time.monotonic()
             self.report(duration=self.duration, engine_used="parallel")
