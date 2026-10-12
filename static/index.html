@@ -61,7 +61,7 @@
             <div class="field"><label for="referer">Referer URL <span class="optional">optional</span></label><input id="referer" type="url" placeholder="https://example.com/watch" spellcheck="false" maxlength="2048"><p class="field-help">The page URL, if the stream requires it.</p></div>
           </div>
           <div class="advanced-fields">
-            <div class="field"><label for="connections">Parallel connections</label><input id="connections" type="number" min="1" max="128" step="1" value="128" required><p class="field-help">Up to 128 segment requests. Automatically reduces on rate limits.</p></div>
+            <div class="field"><label for="connections">Connection ceiling</label><input id="connections" type="number" min="1" max="128" step="1" value="4" required><p class="field-help">Start with 4. Shared per source across jobs; paced and reduced on throttling. Raise only if the source permits it.</p></div>
             <div class="field"><label for="download-engine">Download method</label><div class="select-wrap"><select id="download-engine"><option value="auto">Automatic · parallel with FFmpeg fallback</option><option value="parallel">Parallel segments only</option><option value="ffmpeg">FFmpeg compatibility · sequential</option></select><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></div><p class="field-help">Automatic handles compatible VOD streams locally before encoding.</p></div>
           </div>
           <details class="access-options" id="access-options">

@@ -41,6 +41,7 @@ class FFmpegRelay:
             task.cancel()
         await asyncio.gather(*self.connections, return_exceptions=True)
         await self.client.aclose()
+        await self.transport.close_sources()
 
     def register(self, url, kind="segment"):
         checked_url(url)

@@ -9,6 +9,7 @@ import errno
 import math
 from pathlib import Path
 import re
+import random
 import shutil
 import time
 from urllib.parse import urljoin, urlsplit
@@ -21,6 +22,7 @@ except ImportError:  # Windows has no POSIX file-descriptor limit API.
     resource = None
 
 MAX_CONNECTIONS = 128
+DEFAULT_CONNECTIONS = 4
 RETRY_CODES = {408, 425, 429, 500, 502, 503, 504}
 
 
@@ -111,31 +113,37 @@ def attributes(line):
 def retry_delay(value, attempt):
     if value:
         try:
-            return min(120, max(0, float(value)))
+            seconds = float(value)
+            if math.isfinite(seconds):
+                return max(0, seconds)
         except ValueError:
             try:
                 when = parsedate_to_datetime(value)
                 if when.tzinfo is None:
                     when = when.replace(tzinfo=timezone.utc)
-                return min(120, max(0, (when - datetime.now(timezone.utc)).total_seconds()))
+                return max(0, (when - datetime.now(timezone.utc)).total_seconds())
             except (ValueError, TypeError, OverflowError):
                 pass
     return min(10, .4 * 2 ** attempt)
 
 
 class AdaptiveWindow:
-    def __init__(self, limit):
+    def __init__(self, limit, paced=False):
         self.limit = limit
         self.maximum = limit
         self.successes = 0
         self.active = 0
         self.not_before = 0
+        self.next_start = 0
+        self.paced = paced
         self.condition = asyncio.Condition()
 
     async def acquire(self):
         async with self.condition:
-            while self.active >= self.limit or time.monotonic() < self.not_before:
-                delay = self.not_before - time.monotonic()
+            while self.active >= self.limit or time.monotonic() < max(self.not_before, self.next_start):
+                delay = max(self.not_before, self.next_start) - time.monotonic()
+                if delay > 300:
+                    raise AccessError("The source requested a cooldown longer than five minutes. Try this source again later.")
                 try:
                     if delay > 0:
                         await asyncio.wait_for(self.condition.wait(), delay)
@@ -144,6 +152,8 @@ class AdaptiveWindow:
                 except asyncio.TimeoutError:
                     pass
             self.active += 1
+            if self.paced:
+                self.next_start = time.monotonic() + .2 / math.sqrt(self.limit) + random.uniform(0, .02)
 
     async def release(self):
         async with self.condition:
@@ -160,10 +170,32 @@ class AdaptiveWindow:
     async def success(self):
         async with self.condition:
             self.successes += 1
-            if self.limit < self.maximum and self.successes >= max(8, self.limit * 2) and time.monotonic() > self.not_before + 1:
+            if self.limit < self.maximum and self.successes >= max(8, self.limit * 2) and time.monotonic() > self.not_before + 30:
                 self.limit += 1
                 self.successes = 0
                 self.condition.notify_all()
+
+
+class SourceWindow(AdaptiveWindow):
+    """One paced, adaptive budget per origin shared by every job/transport."""
+    def __init__(self, limit):
+        super().__init__(limit, paced=True)
+        self.owners = {}
+
+    async def register(self, transport):
+        async with self.condition:
+            self.owners[transport] = transport.connection_limit
+            self.maximum = min(self.owners.values())
+            self.limit = min(self.limit, self.maximum)
+            self.condition.notify_all()
+
+    async def unregister(self, transport):
+        async with self.condition:
+            self.owners.pop(transport, None)
+            if self.owners:
+                self.maximum = min(self.owners.values())
+                self.limit = min(self.limit, self.maximum)
+            self.condition.notify_all()
 
 
 @dataclass
@@ -190,6 +222,34 @@ class HLSDownloader:
         self.connection_limit = safe_connection_limit(options.connections)
         self.window = AdaptiveWindow(self.connection_limit)
         self.client = None
+        self.sources = {}
+
+    async def source_window(self, url):
+        key = origin(url)
+        if key not in self.sources:
+            # The event loop owns this registry so separate app/test loops never
+            # share asyncio locks. No request URLs or authentication are stored.
+            loop = asyncio.get_running_loop()
+            registry = getattr(loop, '_vid_down_sources', None)
+            if registry is None:
+                registry = loop._vid_down_sources = {}
+            if key not in registry:
+                registry[key] = SourceWindow(self.connection_limit)
+            self.sources[key] = registry[key]
+            await self.sources[key].register(self)
+        return self.sources[key]
+
+    @asynccontextmanager
+    async def source_session(self):
+        try:
+            yield
+        finally:
+            await self.close_sources()
+
+    async def close_sources(self):
+        for window in self.sources.values():
+            await window.unregister(self)
+        self.sources.clear()
 
     def headers(self, url):
         headers = {"User-Agent": self.options.user_agent}
@@ -208,12 +268,13 @@ class HLSDownloader:
         if not force and now - self.last_report < .15:
             return
         self.last_report = now
+        connections = min([self.window.limit] + [window.limit for window in self.sources.values()])
         self.report(
-            stage=f"Downloading segments · {self.completed}/{len(self.assets)} files · {self.window.limit} connections",
+            stage=f"Downloading segments · {self.completed}/{len(self.assets)} files · {connections} connections",
             progress=round(30 * self.completed / max(1, len(self.assets)), 1),
             download_bytes=self.bytes_downloaded,
             download_speed=round(self.bytes_downloaded / max(.1, now - self.started)),
-            connections=self.window.limit, downloaded_segments=self.completed, total_segments=len(self.assets),
+            connections=connections, downloaded_segments=self.completed, total_segments=len(self.assets),
         )
 
     def asset(self, url, kind="segment", byte_range=None):
@@ -238,15 +299,20 @@ class HLSDownloader:
                 headers["Accept-Encoding"] = "identity"
                 start, length = byte_range
                 headers["Range"] = f"bytes={start}-{start + length - 1}"
-            async with self.client.stream("GET", url, headers=headers, follow_redirects=False) as response:
-                if response.status_code in {301, 302, 303, 307, 308}:
-                    location = response.headers.get("location")
-                    if not location:
-                        raise AccessError("The stream returned a redirect without a destination.")
-                    url = urljoin(str(response.url), location)
-                    continue
-                yield response
-                return
+            window = await self.source_window(url)
+            await window.acquire()
+            try:
+                async with self.client.stream("GET", url, headers=headers, follow_redirects=False) as response:
+                    if response.status_code in {301, 302, 303, 307, 308}:
+                        location = response.headers.get("location")
+                        if not location:
+                            raise AccessError("The stream returned a redirect without a destination.")
+                        url = urljoin(str(response.url), location)
+                        continue
+                    yield response
+                    return
+            finally:
+                await window.release()
         raise AccessError("The stream returned too many redirects.")
 
     async def transfer(self, url, path=None, byte_range=None, is_key=False):
@@ -260,11 +326,15 @@ class HLSDownloader:
                     status = response.status_code
                     host = response.url.host
                     if status in RETRY_CODES:
+                        delay = retry_delay(response.headers.get("retry-after"), attempt) + random.uniform(0, .25)
+                        if status in {429, 503} or response.headers.get("retry-after"):
+                            delay = max(1, delay)
+                            await (await self.source_window(str(response.url))).throttle(delay)
+                            await self.window.throttle(delay)
+                        if delay > 300:
+                            raise AccessError(f"HTTP {status} from {host}. The source requested a cooldown longer than five minutes; try again later.")
                         if attempt == self.options.retries:
                             raise AccessError(f"HTTP {status} from {host} after retries. Reduce connections or try again later.")
-                        delay = retry_delay(response.headers.get("retry-after"), attempt)
-                        if status == 429:
-                            await self.window.throttle(delay)
                     elif status >= 400:
                         if status in {401, 403}:
                             raise AccessError(f"HTTP {status} from {host}. Use a current signed URL, the required Referer, or your session cookies/headers. A different downloader cannot grant access.")
@@ -316,7 +386,9 @@ class HLSDownloader:
                         if part:
                             part.replace(path)
                             await self.window.success()
+                            await (await self.source_window(str(response.url))).success()
                             return str(response.url)
+                        await (await self.source_window(str(response.url))).success()
                         return bytes(body).decode("utf-8-sig"), str(response.url)
             except (httpx.HTTPError, OSError) as error:
                 if isinstance(error, OSError):
@@ -330,7 +402,7 @@ class HLSDownloader:
                     raise AccessError(f"The configured proxy denied the connection to {urlsplit(url).hostname}. Check proxy authentication and the cloud domain allowlist.") from None
                 if attempt == self.options.retries:
                     raise AccessError(f"Could not reach {urlsplit(url).hostname} after retries. Check network/domain access, your configured proxy, and the URL. Try an alternative URL or run on your own computer if cloud access is restricted.") from None
-                delay = retry_delay(None, attempt)
+                delay = retry_delay(None, attempt) + random.uniform(0, .25)
             finally:
                 try:
                     if part:
@@ -454,7 +526,7 @@ class HLSDownloader:
         self.directory.mkdir(parents=True, exist_ok=True)
         limits = httpx.Limits(max_connections=self.connection_limit, max_keepalive_connections=self.connection_limit)
         timeout = httpx.Timeout(30, connect=15, pool=30)
-        async with httpx.AsyncClient(limits=limits, timeout=timeout, follow_redirects=True) as client:
+        async with httpx.AsyncClient(limits=limits, timeout=timeout, follow_redirects=True) as client, self.source_session():
             self.client = client
             local_playlist = await self.playlist(url)
             if not self.assets:

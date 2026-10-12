@@ -21,7 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from downloader import AccessError, CompatibilityError, HLSDownloader, MAX_CONNECTIONS, configure_file_limit, storage_error
+from downloader import AccessError, CompatibilityError, DEFAULT_CONNECTIONS, HLSDownloader, MAX_CONNECTIONS, configure_file_limit, storage_error
 from relay import FFmpegRelay
 
 ROOT = Path(__file__).resolve().parent
@@ -37,7 +37,7 @@ class DownloadRequest(BaseModel):
     preset: str = Field(default="balanced", pattern="^(small|balanced|original)$")
     target_mb: float | None = Field(default=None, ge=0.1, le=100000)
     referer: str = Field(default="", max_length=2048)
-    connections: int = Field(default=MAX_CONNECTIONS, ge=1, le=MAX_CONNECTIONS)
+    connections: int = Field(default=DEFAULT_CONNECTIONS, ge=1, le=MAX_CONNECTIONS)
     engine: str = Field(default="auto", pattern="^(auto|parallel|ffmpeg)$")
     retries: int = Field(default=4, ge=0, le=8)
     user_agent: str = Field(default="vid_down/1.1", min_length=1, max_length=1024)
@@ -107,7 +107,7 @@ async def resolve_playlist(url, options, depth=0):
         raise ValueError("The playlist contains too many nested variants.")
     DownloadRequest.http_url(url)
     transport = HLSDownloader(options, DATA)
-    async with httpx.AsyncClient(timeout=20) as client:
+    async with httpx.AsyncClient(timeout=20) as client, transport.source_session():
         transport.client = client
         text, resolved_url = await transport.transfer(url)
     lines = [line.strip() for line in text.splitlines() if line.strip()]

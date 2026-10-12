@@ -319,7 +319,8 @@ class AppIntegrationTests(unittest.TestCase):
         parallel = asyncio.run(run(16, 'parallel'))
         with QuietHandler.lock:
             peak = QuietHandler.peak
-        self.assertGreater(peak, 4)
+        # Paced starts avoid a burst of 16 requests to this short-latency source.
+        self.assertGreater(peak, 1)
         self.assertLessEqual(peak, 16)
         self.assertLess(parallel, serial / 2)
         print(f'\nTransport benchmark: serial={serial:.3f}s, parallel={parallel:.3f}s, speedup={serial / parallel:.1f}x, peak={peak} requests')
