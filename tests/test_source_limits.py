@@ -51,7 +51,7 @@ class SourceLimitTests(unittest.IsolatedAsyncioTestCase):
     async def test_two_jobs_share_ceiling_and_pacing(self):
         observed = ObservedTransport()
         with tempfile.TemporaryDirectory() as directory:
-            jobs = [HLSDownloader(options(), directory) for _ in range(2)]
+            jobs = [HLSDownloader(options(connections=4), directory) for _ in range(2)]
             async with AsyncExitStack() as stack:
                 for job in jobs:
                     job.client = await stack.enter_async_context(httpx.AsyncClient(transport=observed))
@@ -63,8 +63,30 @@ class SourceLimitTests(unittest.IsolatedAsyncioTestCase):
             self.assertLessEqual(observed.peak, 4)
             self.assertEqual(observed.active, 0)
             self.assertEqual(len(observed.starts), 16)
-            self.assertTrue(all(b-a >= .095 for a, b in zip(observed.starts, observed.starts[1:])))
+            self.assertTrue(all(b-a >= .023 for a, b in zip(observed.starts, observed.starts[1:])))
             self.assertTrue(all(path.read_bytes() == b'segment' for path in Path(directory).glob('*.ts')))
+            self.assertFalse(any(job.sources for job in jobs))
+
+    async def test_balanced_default_warms_up_and_grows_with_healthy_traffic(self):
+        self.assertEqual(DEFAULT_CONNECTIONS, 8)
+        observed = ObservedTransport()
+        with tempfile.TemporaryDirectory() as directory:
+            jobs = [HLSDownloader(options(), directory) for _ in range(2)]
+            async with AsyncExitStack() as stack:
+                for job in jobs:
+                    job.client = await stack.enter_async_context(httpx.AsyncClient(transport=observed))
+                    await stack.enter_async_context(job.source_session())
+                window = await jobs[0].source_window(options().url)
+                self.assertEqual(window.limit, 4)
+                self.assertEqual(window.maximum, 8)
+                await asyncio.gather(*(job.transfer(f'https://source.example/{i}.ts', Path(directory)/f'{j}-{i}.ts')
+                    for j, job in enumerate(jobs) for i in range(24)))
+                self.assertGreater(window.limit, 4)
+                self.assertLessEqual(window.limit, 8)
+            self.assertGreater(observed.peak, 4)
+            self.assertLessEqual(observed.peak, 8)
+            self.assertEqual(observed.active, 0)
+            self.assertEqual(len(observed.starts), 48)
             self.assertFalse(any(job.sources for job in jobs))
 
     async def test_throttle_pauses_other_job_and_keeps_limit_after_completion(self):

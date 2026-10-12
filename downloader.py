@@ -22,7 +22,7 @@ except ImportError:  # Windows has no POSIX file-descriptor limit API.
     resource = None
 
 MAX_CONNECTIONS = 128
-DEFAULT_CONNECTIONS = 4
+DEFAULT_CONNECTIONS = 8
 RETRY_CODES = {408, 425, 429, 500, 502, 503, 504}
 
 
@@ -66,7 +66,7 @@ def safe_connection_limit(requested):
 def storage_error(error):
     """Explain OS failures without exposing paths or upstream credentials."""
     if error.errno in {errno.EMFILE, errno.ENFILE}:
-        return "The open-file limit was reached. Reduce connections to 16, stop other downloads, or restart the updated app."
+        return "The open-file limit was reached. Reduce connections to 1–4, stop other downloads, or restart the updated app."
     if error.errno in {errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)}:
         return "The download disk is full or its storage quota was reached. Free space or set VID_DOWN_DATA to another disk."
     if error.errno in {errno.EACCES, errno.EPERM}:
@@ -153,7 +153,7 @@ class AdaptiveWindow:
                     pass
             self.active += 1
             if self.paced:
-                self.next_start = time.monotonic() + .2 / math.sqrt(self.limit) + random.uniform(0, .02)
+                self.next_start = time.monotonic() + .05 / math.sqrt(self.limit) + random.uniform(0, .005)
 
     async def release(self):
         async with self.condition:
@@ -180,7 +180,22 @@ class SourceWindow(AdaptiveWindow):
     """One paced, adaptive budget per origin shared by every job/transport."""
     def __init__(self, limit):
         super().__init__(limit, paced=True)
+        # Warm up gently, then use a healthy source's selected ceiling instead
+        # of permanently holding every job to its initial connection count.
+        self.limit = min(4, limit)
+        self.last_increase = time.monotonic()
         self.owners = {}
+
+    async def success(self):
+        async with self.condition:
+            self.successes += 1
+            now = time.monotonic()
+            if (self.limit < self.maximum and self.successes >= max(8, self.limit * 2)
+                    and now > self.not_before + 30 and now - self.last_increase >= 2):
+                self.limit += 1
+                self.successes = 0
+                self.last_increase = now
+                self.condition.notify_all()
 
     async def register(self, transport):
         async with self.condition:
